@@ -32,50 +32,95 @@ jobs:
       with:
         node-version: '22'
 
-    - name: 🧹 Install Tools
+    - name: 🧹 System Cleanup & Install Pro Tools
       run: |
+        echo "🧹 Clearing Disk Space..."
+        sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        
         sudo apt-get update -qq
-        sudo apt-get install -y -qq ffmpeg imagemagick webp jq tmate ttyd btop
+        sudo apt-get install -y -qq ffmpeg imagemagick webp jq tmate neofetch ttyd btop
+        
+        # Cloudflared Download & Install (Fixed Error)
         wget -q https://github.com
         sudo dpkg -i cloudflared-linux-amd64.deb
+        
         sudo npm install -g pm2
         curl -fsSL https://raw.githubusercontent.com | sudo bash
+        ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
 
-    - name: 🚀 Start All Bots
+    - name: 💾 Setup Ghost Auto-Save (savecode)
       run: |
+        git config --global user.email "marin-bot@auto.sync"
+        git config --global user.name "Marin Auto-Saver"
+        git remote set-url origin https://${{ secrets.PAT_TOKEN }}@://github.com{{ github.repository }}.git
+        
+        echo "**/node_modules/" >> .gitignore
+        echo "**/*.log" >> .gitignore
+        
+        mv .github /tmp/.github_hidden
+        
+        echo '#!/bin/bash' > savecode
+        echo 'echo "⏳ Saving ALL BOTS to GitHub..."' >> savecode
+        echo 'mv /tmp/.github_hidden ./.github' >> savecode 
+        echo 'git add .' >> savecode
+        echo 'git commit -m "💾 Auto-saved [skip ci]" || echo "No changes."' >> savecode
+        echo 'git push origin HEAD || echo "Push failed."' >> savecode
+        echo 'mv ./.github /tmp/.github_hidden' >> savecode 
+        
+        sudo mv savecode /usr/local/bin/savecode
+        sudo chmod +x /usr/local/bin/savecode
+
+    - name: 🚀 Auto-Detect & Start All Bots
+      run: |
+        BOT_LIST=""
         for dir in */ ; do
           if [ -d "$dir" ] && [ -f "$dir/package.json" ]; then
-            cd "$dir" && npm install --quiet
-            pm2 start index.js --name "$(basename "$dir")" || pm2 start npm --name "$(basename "$dir")" -- start
+            BOT_NAME=$(basename "$dir")
+            BOT_LIST="$BOT_LIST $BOT_NAME"
+            cd "$dir"
+            npm install --quiet
+            if [ -f "index.js" ]; then
+               pm2 start index.js --name "$BOT_NAME"
+            else
+               pm2 start npm --name "$BOT_NAME" -- start
+            fi
             cd ..
           fi
         done
+        echo "ACTIVE_BOTS=${BOT_LIST:-'No bots found'}" >> $GITHUB_ENV
 
-    - name: 🌐 Open Web Panels (Cloudflare)
+    - name: 🌐 Open Web Panels
       run: |
-        filebrowser -a 0.0.0.0 -p 8080 -r . --noauth > /tmp/fb.log 2>&1 &
-        ttyd -p 61208 btop > /tmp/bt.log 2>&1 &
-        cloudflared tunnel --url http://127.0.0.1:8080 > /tmp/cf_f.log 2>&1 &
-        cloudflared tunnel --url http://127.0.0.1:61208 > /tmp/cf_b.log 2>&1 &
+        set +e 
+        filebrowser -a 0.0.0.0 -p 8080 -r . --noauth > /tmp/cf_file.log 2>&1 &
+        ttyd -R -p 61208 btop > /tmp/btop.log 2>&1 &
+        sleep 3
+        cloudflared tunnel --url http://127.0.0.1:8080 > /tmp/f_url.log 2>&1 &
+        cloudflared tunnel --url http://127.0.0.1:61208 > /tmp/b_url.log 2>&1 &
         sleep 15
-        echo "F_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_f.log | head -n 1)" >> $GITHUB_ENV
-        echo "B_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_b.log | head -n 1)" >> $GITHUB_ENV
+        echo "FILE_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/f_url.log | head -n 1)" >> $GITHUB_ENV
+        echo "BTOP_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/b_url.log | head -n 1)" >> $GITHUB_ENV
 
-    - name: 🔄 Start Tmate & Alert
+    - name: 🔄 Start Tmate & Discord Alert
       env:
         DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
       run: |
+        set +e 
         tmate -S /tmp/tmate.sock new-session -d
         tmate -S /tmp/tmate.sock wait tmate-ready
         SSH_MSG=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
-        PAYLOAD=$(jq -n --arg ssh "$SSH_MSG" --arg f "$F_URL" --arg b "$B_URL" \
-          '{content: "🔄 **VPS Restarted (Loop Active)**\n📁 File Manager: \($f)\n📊 System: \($b)\n💻 SSH: `\($ssh)`"}')
+        
+        PAYLOAD=$(jq -n --arg ssh "$SSH_MSG" --arg f "$FILE_URL" --arg b "$BTOP_URL" --arg bots "$ACTIVE_BOTS" \
+          '{content: "🚨 **VPS DASHBOARD** 🚨\n🤖 Bots: `\($bots)`\n📁 Files: \($f)\n📊 Health: \($b)\n💻 SSH: `\($ssh)`\n\n_💡 Save changes: `savecode`_"}')
+        
         curl -H "Content-Type: application/json" -d "$PAYLOAD" $DISCORD_WEBHOOK
         
-        # 5.5 Hours Wait
-        sleep 20000
+        # Wait for 5 hours 45 mins
+        sleep 20700
+        savecode || true
 
-    - name: 🧟 Respawn (Auto-Restart)
+    - name: 🧟 Respawn Zombie
       uses: actions/github-script@v6
       with:
         github-token: ${{ secrets.PAT_TOKEN }}
@@ -83,7 +128,7 @@ jobs:
           await github.rest.actions.createWorkflowDispatch({
             owner: context.repo.owner,
             repo: context.repo.repo,
-            workflow_id: 'marin.yml', // Is file ka name check karlein (e.g. marin.yml)
+            workflow_id: 'marin.yml',
             ref: 'main'
           })
           
