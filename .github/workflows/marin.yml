@@ -1,0 +1,89 @@
+name: Marin VPS 
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+
+concurrency:
+  group: marin-vps
+  cancel-in-progress: true
+
+permissions:
+  actions: write
+  contents: write
+
+env:
+  TZ: 'Asia/Kolkata'
+
+jobs:
+  ultimate-vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+    - name: 📂 Checkout Code
+      uses: actions/checkout@v3
+      with:
+        token: ${{ secrets.PAT_TOKEN }}
+        fetch-depth: 0
+
+    - name: 🟢 Setup Node.js 22
+      uses: actions/setup-node@v3
+      with:
+        node-version: '22'
+
+    - name: 🧹 Install Tools
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq ffmpeg imagemagick webp jq tmate ttyd btop
+        wget -q https://github.com
+        sudo dpkg -i cloudflared-linux-amd64.deb
+        sudo npm install -g pm2
+        curl -fsSL https://raw.githubusercontent.com | sudo bash
+
+    - name: 🚀 Start All Bots
+      run: |
+        for dir in */ ; do
+          if [ -d "$dir" ] && [ -f "$dir/package.json" ]; then
+            cd "$dir" && npm install --quiet
+            pm2 start index.js --name "$(basename "$dir")" || pm2 start npm --name "$(basename "$dir")" -- start
+            cd ..
+          fi
+        done
+
+    - name: 🌐 Open Web Panels (Cloudflare)
+      run: |
+        filebrowser -a 0.0.0.0 -p 8080 -r . --noauth > /tmp/fb.log 2>&1 &
+        ttyd -p 61208 btop > /tmp/bt.log 2>&1 &
+        cloudflared tunnel --url http://127.0.0.1:8080 > /tmp/cf_f.log 2>&1 &
+        cloudflared tunnel --url http://127.0.0.1:61208 > /tmp/cf_b.log 2>&1 &
+        sleep 15
+        echo "F_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_f.log | head -n 1)" >> $GITHUB_ENV
+        echo "B_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_b.log | head -n 1)" >> $GITHUB_ENV
+
+    - name: 🔄 Start Tmate & Alert
+      env:
+        DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      run: |
+        tmate -S /tmp/tmate.sock new-session -d
+        tmate -S /tmp/tmate.sock wait tmate-ready
+        SSH_MSG=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
+        PAYLOAD=$(jq -n --arg ssh "$SSH_MSG" --arg f "$F_URL" --arg b "$B_URL" \
+          '{content: "🔄 **VPS Restarted (Loop Active)**\n📁 File Manager: \($f)\n📊 System: \($b)\n💻 SSH: `\($ssh)`"}')
+        curl -H "Content-Type: application/json" -d "$PAYLOAD" $DISCORD_WEBHOOK
+        
+        # 5.5 Hours Wait
+        sleep 20000
+
+    - name: 🧟 Respawn (Auto-Restart)
+      uses: actions/github-script@v6
+      with:
+        github-token: ${{ secrets.PAT_TOKEN }}
+        script: |
+          await github.rest.actions.createWorkflowDispatch({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            workflow_id: 'marin.yml', // Is file ka name check karlein (e.g. marin.yml)
+            ref: 'main'
+          })
+          
