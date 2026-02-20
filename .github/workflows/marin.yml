@@ -41,19 +41,18 @@ jobs:
         sudo apt-get update -qq
         sudo apt-get install -y -qq ffmpeg imagemagick webp jq tmate neofetch ttyd btop
         
-        # Cloudflared Download & Install (Fixed Error)
-        wget -q https://github.com
+        wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
         sudo dpkg -i cloudflared-linux-amd64.deb
         
         sudo npm install -g pm2
-        curl -fsSL https://raw.githubusercontent.com | sudo bash
+        curl -fsSL https://raw.githubusercontent.com/filebrowser/get/master/get.sh | sudo bash
         ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519
 
     - name: 💾 Setup Ghost Auto-Save (savecode)
       run: |
         git config --global user.email "marin-bot@auto.sync"
         git config --global user.name "Marin Auto-Saver"
-        git remote set-url origin https://${{ secrets.PAT_TOKEN }}@://github.com{{ github.repository }}.git
+        git remote set-url origin https://${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}.git
         
         echo "**/node_modules/" >> .gitignore
         echo "**/*.log" >> .gitignore
@@ -64,22 +63,44 @@ jobs:
         echo 'echo "⏳ Saving ALL BOTS to GitHub..."' >> savecode
         echo 'mv /tmp/.github_hidden ./.github' >> savecode 
         echo 'git add .' >> savecode
-        echo 'git commit -m "💾 Auto-saved [skip ci]" || echo "No changes."' >> savecode
-        echo 'git push origin HEAD || echo "Push failed."' >> savecode
+        echo 'git commit -m "💾 Auto-saved Multi-Bot Empire [skip ci]" || echo "No changes to save."' >> savecode
+        echo 'git push origin HEAD || echo "⚠️ Push failed! Check PAT_TOKEN."' >> savecode
         echo 'mv ./.github /tmp/.github_hidden' >> savecode 
+        echo 'echo "✅ Save Process Completed for all bots!"' >> savecode
         
         sudo mv savecode /usr/local/bin/savecode
         sudo chmod +x /usr/local/bin/savecode
 
-    - name: 🚀 Auto-Detect & Start All Bots
+    - name: 🔒 Set SSH Password
       run: |
+        echo "runner:${{ secrets.SSH_PASSWORD }}" | sudo chpasswd
+        sudo usermod -aG sudo runner
+
+    # --- 🚀 ADVANCED MULTI-BOT ENGINE ---
+    - name: 🚀 Auto-Detect & Start All Bots (PM2)
+      env:
+        MONGODB: ${{ secrets.MONGODB }}
+        MODS: ${{ secrets.MODS }}
+        SESSION_ID: ${{ secrets.SESSION_ID }}
+        PACKNAME: ${{ secrets.PACKNAME }}
+      run: |
+        echo "🔍 Scanning for Bot Folders..."
         BOT_LIST=""
+        
         for dir in */ ; do
           if [ -d "$dir" ] && [ -f "$dir/package.json" ]; then
             BOT_NAME=$(basename "$dir")
-            BOT_LIST="$BOT_LIST $BOT_NAME"
+            
+            if [ -z "$BOT_LIST" ]; then
+              BOT_LIST="$BOT_NAME"
+            else
+              BOT_LIST="$BOT_LIST, $BOT_NAME"
+            fi
+            
+            echo "⚙️ Initializing Bot: $BOT_NAME"
             cd "$dir"
-            npm install --quiet
+            npm install
+            
             if [ -f "index.js" ]; then
                pm2 start index.js --name "$BOT_NAME"
             else
@@ -88,39 +109,75 @@ jobs:
             cd ..
           fi
         done
-        echo "ACTIVE_BOTS=${BOT_LIST:-'No bots found'}" >> $GITHUB_ENV
+        pm2 save
+        echo "ACTIVE_BOTS=${BOT_LIST:-'No bots found! Check folder structure.'}" >> $GITHUB_ENV
 
-    - name: 🌐 Open Web Panels
+    # --- 🌐 OPEN WEB PANELS SETUP ---
+    - name: 🌐 Start Open Web Panels & Btop
       run: |
         set +e 
-        filebrowser -a 0.0.0.0 -p 8080 -r . --noauth > /tmp/cf_file.log 2>&1 &
+        
+        # 1. Start File Manager (No Password Mode)
+        filebrowser -a 0.0.0.0 -p 8080 -r . --noauth > /tmp/filebrowser.log 2>&1 &
+        
+        # 2. Start Btop Graph (No Password Mode)
         ttyd -R -p 61208 btop > /tmp/btop.log 2>&1 &
         sleep 3
-        cloudflared tunnel --url http://127.0.0.1:8080 > /tmp/f_url.log 2>&1 &
-        cloudflared tunnel --url http://127.0.0.1:61208 > /tmp/b_url.log 2>&1 &
+        
+        # Start Cloudflare Tunnels
+        cloudflared tunnel --url http://127.0.0.1:8080 > /tmp/cf_file.log 2>&1 &
+        cloudflared tunnel --url http://127.0.0.1:61208 > /tmp/cf_btop.log 2>&1 &
+        
         sleep 15
-        echo "FILE_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/f_url.log | head -n 1)" >> $GITHUB_ENV
-        echo "BTOP_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/b_url.log | head -n 1)" >> $GITHUB_ENV
+        
+        FILE_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_file.log | head -n 1)
+        BTOP_URL=$(grep -o 'https://[-a-zA-Z0-9]*\.trycloudflare\.com' /tmp/cf_btop.log | head -n 1)
+        
+        echo "FILE_MANAGER_URL=${FILE_URL:-'⚠️ Cloudflare Error'}" >> $GITHUB_ENV
+        echo "BTOP_URL=${BTOP_URL:-'⚠️ Cloudflare Error'}" >> $GITHUB_ENV
 
-    - name: 🔄 Start Tmate & Discord Alert
+    # --- 🔄 TMATE SSH & OPEN ALERT ---
+    - name: 🔄 Start Tmate Loop & Discord Alert
       env:
         DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
       run: |
         set +e 
-        tmate -S /tmp/tmate.sock new-session -d
-        tmate -S /tmp/tmate.sock wait tmate-ready
-        SSH_MSG=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
         
-        PAYLOAD=$(jq -n --arg ssh "$SSH_MSG" --arg f "$FILE_URL" --arg b "$BTOP_URL" --arg bots "$ACTIVE_BOTS" \
-          '{content: "🚨 **VPS DASHBOARD** 🚨\n🤖 Bots: `\($bots)`\n📁 Files: \($f)\n📊 Health: \($b)\n💻 SSH: `\($ssh)`\n\n_💡 Save changes: `savecode`_"}')
+        for i in {1..15}; do
+           tmate -S /tmp/tmate.sock kill-session 2>/dev/null || true
+           tmate -S /tmp/tmate.sock new-session -d
+           tmate -S /tmp/tmate.sock wait tmate-ready
+           sleep 5
+           
+           SSH_MSG=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null)
+           
+           if [[ "$SSH_MSG" == *"tmate.io"* ]]; then
+              
+              PAYLOAD=$(jq -n \
+                --arg ssh "$SSH_MSG" \
+                --arg fileUrl "$FILE_MANAGER_URL" \
+                --arg btopUrl "$BTOP_URL" \
+                --arg bots "$ACTIVE_BOTS" \
+                '{content: "🚨 **VPS Dashboard** 🚨\n\n✅ **Status:** Online (Open Access) 🟢\n🤖 **Active Bots:** `\($bots)`\n\n📁 **File Manager:** \($fileUrl)\n📊 **VPS Health:** \($btopUrl)\n\n💻 **SSH Terminal:** `\($ssh)`\n📌 **Connect via Termius App**\n\n**🎮 MASTER CONTROL COMMANDS:**\n▶️ **Start:** `pm2 start \"Bot_Name\"`\n⏹️ **Stop:** `pm2 stop \"Bot_Name\"`\n🔄 **Restart:** `pm2 restart \"Bot_Name\"`\n📝 **Logs:** `pm2 logs \"Bot_Name\"`\n📊 **All Bots:** `pm2 status`\n\n_💡 Save changes using `savecode`_"}')
+              
+              curl -H "Content-Type: application/json" -d "$PAYLOAD" $DISCORD_WEBHOOK
+              
+              echo "RESTART_SAFE=true" >> $GITHUB_ENV
+              
+              for m in {1..69}; do sleep 300; done
+              
+              echo "⏳ 5 Hours 45 Mins complete! Auto-saving all bots to GitHub..."
+              savecode || true
+              exit 0
+           fi
+           sleep 5
+        done
         
-        curl -H "Content-Type: application/json" -d "$PAYLOAD" $DISCORD_WEBHOOK
-        
-        # Wait for 5 hours 45 mins
-        sleep 20700
-        savecode || true
+        curl -H "Content-Type: application/json" -d '{"content": "❌ **ERROR:** Tmate Server failed. Auto-restart paused."}' $DISCORD_WEBHOOK
+        exit 1
 
     - name: 🧟 Respawn Zombie
+      if: env.RESTART_SAFE == 'true'
       uses: actions/github-script@v6
       with:
         github-token: ${{ secrets.PAT_TOKEN }}
@@ -131,4 +188,3 @@ jobs:
             workflow_id: 'marin.yml',
             ref: 'main'
           })
-          
